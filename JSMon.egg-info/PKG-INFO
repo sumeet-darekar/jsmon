@@ -1,3 +1,25 @@
+Metadata-Version: 2.4
+Name: JSMon
+Version: 1.0
+Summary: A python script that monitors JavaScript files.
+Home-page: https://github.com/robre/jsmon
+Author: r0bre
+Author-email: mail@r0b.re
+License: MIT
+License-File: LICENSE
+Requires-Dist: requests
+Requires-Dist: jsbeautifier
+Requires-Dist: python-decouple
+Requires-Dist: slackclient
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
+
 # JSMon
 JSMon - JavaScript Change Monitor for BugBounty
 

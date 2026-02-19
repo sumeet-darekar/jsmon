@@ -1,0 +1,4 @@
+requests
+jsbeautifier
+python-decouple
+slackclient

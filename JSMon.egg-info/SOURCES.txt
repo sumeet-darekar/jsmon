@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+JSMon.egg-info/PKG-INFO
+JSMon.egg-info/SOURCES.txt
+JSMon.egg-info/dependency_links.txt
+JSMon.egg-info/requires.txt
+JSMon.egg-info/top_level.txt

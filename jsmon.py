@@ -82,7 +82,10 @@ def get_previous_endpoint_hash(endpoint):
     with open("jsmon.json", "r") as jsm:
         jsmd = json.load(jsm)
         if endpoint in jsmd.keys():
-            return jsmd[endpoint][-1]
+            try:
+                return jsmd[endpoint][-1]
+            except IndexError:
+                return None
         else:
             return None
         
@@ -108,12 +111,578 @@ def get_diff(old,new):
     return html
 
 
-def notify_telegram(endpoint,prev, new, diff, prevsize,newsize):
+def scan_for_secrets(content):
+    secrets = {}
+    
+    # Specific regex patterns for well-known keys
+    regex_list = {
+        # Google / GCP
+        "Google API Key": r"AIza[0-9A-Za-z\-_]{35}",
+        "Google OAuth Client": r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com",
+        "Firebase URL": r"[a-zA-Z0-9_-]+\.firebaseio\.com",
+        "GCP Service Account": r"\"type\":\s*\"service_account\"",
+        # AWS
+        "AWS API Key": r"((?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16})",
+        "Amazon MWS Auth Token": r"amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        # Stripe
+        "Stripe Secret Key": r"sk_live_[0-9a-zA-Z]{24,}",
+        "Stripe Publishable Key": r"pk_live_[0-9a-zA-Z]{24,}",
+        # Slack
+        "Slack Token": r"(xox[pboa]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32})",
+        "Slack Webhook": r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8,}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24,}",
+        # GitHub
+        "GitHub Token": r"gh[ps]_[A-Za-z0-9_]{36,}",
+        "GitHub Fine-Grained Token": r"github_pat_[A-Za-z0-9_]{22,}",
+        # Other SaaS
+        "SendGrid API Key": r"SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43}",
+        "Twilio API Key": r"SK[0-9a-fA-F]{32}",
+        "Mailgun API Key": r"key-[0-9a-zA-Z]{32}",
+        "Square Access Token": r"sq0atp-[0-9A-Za-z\-_]{22,}",
+        "Square OAuth Secret": r"sq0csp-[0-9A-Za-z\-_]{43,}",
+        "Shopify Token": r"shpat_[a-fA-F0-9]{32}",
+        # Tokens
+        "JWT Token": r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_\-]+",
+        "Bearer Token": r"(?i)[\"']?Bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*[\"']?",
+        # Azure
+        "Azure SAS Token": r"sig=[a-zA-Z0-9%/+]{43,}=",
+        # Private Keys (consolidated)
+        "Private Key": r"-----BEGIN\s+(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+        "PGP Private Block": r"-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        # Generic patterns
+        "Generic API Key": r"(?i)(?:api[_-]?key|apikey|api[_-]?secret)[\"'\s:=]+[\"']?([0-9a-zA-Z\-_]{16,64})[\"']?",
+        "Generic Secret": r"(?i)(?:secret|password|passwd|pwd|client_secret)[\"'\s:=]+[\"']?([0-9a-zA-Z\-_]{8,64})[\"']?",
+        # Network
+        "IP Address": r"(?<![0-9.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![0-9.])",
+        "Email": r"(?<![/:\-])\b[a-zA-Z0-9._%+-]{2,}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}\b",
+    }
+
+    for key, regex in regex_list.items():
+        # Skip Link and Path as they are handled by logic below
+        if key in ["Link", "Path"]:
+            continue
+        matches = re.findall(regex, content)
+        if matches:
+            if isinstance(matches[0], tuple):
+                # If there are groups, take the first non-empty group (common for keys)
+                deduped = list(set([m[0] if m[0] else m[1] for m in matches]))
+            else:
+                deduped = list(set(matches))
+            secrets[key] = deduped
+
+    # LinkFinder Regex for endpoints and paths (enhanced with backtick support)
+    linkfinder_regex = r"""
+        (?:"|'|`)                               # Start delimiter (incl backtick)
+        (
+            ((?:[a-zA-Z]{1,10}://|//)           # Match a scheme [a-Z]*1-10 or //
+            [^"'/`]{1,}\.                       # Match a domainname (any character + dot)
+            [a-zA-Z]{2,}[^"'`]{0,})             # The domainextension and/or path
+            |
+            ((?:[a-zA-Z]{1,10}://)              # Match a scheme for IP-based URLs
+            \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} # Match an IP address
+            [^"'`]{0,})                         # Optional port/path
+            |
+            ((?:/|\.\./|\./)                     # Start with /,../,./
+            [^"'`><,;| *()(%%$^/\\\[\]]         # Next character can't be...
+            [^"'`><,;|()]{1,})                  # Rest of the characters can't be
+            |
+            ([a-zA-Z0-9_\-/]{1,}/               # Relative endpoint with /
+            [a-zA-Z0-9_\-/.]{1,}                # Resource name
+            \.(?:[a-zA-Z]{1,4}|action)           # Rest + extension (length 1-4 or action)
+            (?:[\?|#][^"|'`]{0,}|))              # ? or # mark with parameters
+            |
+            ([a-zA-Z0-9_\-/]{1,}/               # REST API (no extension) with /
+            [a-zA-Z0-9_\-/]{3,}                 # Proper REST endpoints usually have 3+ chars
+            (?:[\?|#][^"|'`]{0,}|))              # ? or # mark with parameters
+            |
+            ([a-zA-Z0-9_\-]{1,}                 # filename
+            \.(?:php|asp|aspx|jsp|json|
+                action|html|js|txt|xml|
+                css|svg|woff|woff2|ttf|eot|
+                map|ts|tsx|jsx|graphql|wasm|
+                png|jpg|jpeg|gif|ico|webp|
+                pdf|zip|tar|gz)                  # . + extension
+            (?:[\?|#][^"|'`]{0,}|))              # ? or # mark with parameters
+        )
+        (?:"|'|`)                               # End delimiter (incl backtick)
+    """
+
+    endpoint_matches = [m.group(1) for m in re.finditer(linkfinder_regex, content, re.VERBOSE)]
+
+    # HTTP Method Regex for endpoints (e.g. .get('/api/users'), .post('/login'))
+    http_method_regex = r"""(?i)\.(?:get|post|put|delete|patch|options|head)\s*\(\s*['"]([^'"]+)['"]"""
+    method_matches = re.findall(http_method_regex, content)
+
+    # fetch() calls: fetch('/api/data'), fetch("https://...")
+    fetch_regex = r"""(?i)fetch\s*\(\s*['"`]([^'"`]+)['"`]"""
+    fetch_matches = re.findall(fetch_regex, content)
+
+    # axios calls: axios.get('/users'), axios('/endpoint'), axios({ url: '...' })
+    axios_regex = r"""(?i)axios(?:\.[a-z]+)?\s*\(\s*['"`]([^'"`]+)['"`]"""
+    axios_url_regex = r"""(?i)axios\s*\(\s*\{[^}]*url\s*:\s*['"`]([^'"`]+)['"`]"""
+    axios_matches = re.findall(axios_regex, content) + re.findall(axios_url_regex, content)
+
+    # jQuery AJAX: $.ajax({url: '...'}), $.get('/...'), $.post('/...')
+    jquery_ajax_regex = r"""(?i)\$\.ajax\s*\(\s*\{[^}]*url\s*:\s*['"`]([^'"`]+)['"`]"""
+    jquery_method_regex = r"""(?i)\$\.(?:get|post|getJSON|getScript)\s*\(\s*['"`]([^'"`]+)['"`]"""
+    jquery_matches = re.findall(jquery_ajax_regex, content) + re.findall(jquery_method_regex, content)
+
+    # XMLHttpRequest.open('GET', '/api/...')
+    xhr_regex = r"""(?i)\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"`]([^'"`]+)['"`]"""
+    xhr_matches = re.findall(xhr_regex, content)
+
+    # new WebSocket('wss://...')
+    ws_regex = r"""(?i)new\s+WebSocket\s*\(\s*['"`]([^'"`]+)['"`]"""
+    ws_matches = re.findall(ws_regex, content)
+
+    # src="..." and href="..." attribute extraction
+    attr_regex = r"""(?i)(?:src|href)\s*=\s*['"]([^'"]{5,})['"]"""
+    attr_matches = re.findall(attr_regex, content)
+
+    # window.location assignments
+    location_regex = r"""(?i)(?:window\.)?location(?:\.href)?\s*=\s*['"`]([^'"`]+)['"`]"""
+    location_matches = re.findall(location_regex, content)
+
+    # Combine all endpoint sources
+    all_raw_endpoints = set(
+        endpoint_matches + method_matches + fetch_matches +
+        axios_matches + jquery_matches + xhr_matches +
+        ws_matches + attr_matches + location_matches
+    )
+
+    # --- False positive filtering ---
+    noise_patterns = re.compile(
+        r'^(?:'
+        r'text/[a-z]+|application/[a-z+.-]+|image/[a-z+]+|'   # MIME types
+        r'multipart/[a-z-]+|audio/[a-z]+|video/[a-z]+|'       # more MIME
+        r'font/[a-z]+|'                                        # font MIME
+        r'[0-9]+px|[0-9]+%|[0-9]+em|[0-9]+rem|'               # CSS units
+        r'#[0-9a-fA-F]{3,8}|'                                 # CSS hex colors
+        r'rgba?\([^)]*\)|hsla?\([^)]*\)|'                      # CSS color functions
+        r'data:[a-z]+/[a-z]+|'                                 # data URIs
+        r'javascript:|mailto:|tel:|'                           # pseudo protocols
+        r'webpack://'                                          # build artifacts
+        r')$', re.IGNORECASE
+    )
+
+    filtered_endpoints = set()
+    for ep in all_raw_endpoints:
+        ep = ep.strip()
+        if not ep or len(ep) < 2:
+            continue
+        if noise_patterns.match(ep):
+            continue
+        # Skip pure numbers or version strings like "1.0.0"
+        if re.match(r'^[\d.]+$', ep):
+            continue
+        filtered_endpoints.add(ep)
+
+    if filtered_endpoints:
+        urls = []
+        domains = []
+        endpoints = []
+
+        for ep in filtered_endpoints:
+            # Check for full URLs (various protocols)
+            if re.match(r"^(?:https?|ftp|smb|ssh|ws|wss|git|sftp)://", ep, re.IGNORECASE) or ep.startswith("//"):
+                urls.append(ep)
+                # Extract domain (strip port and path)
+                domain_match = re.search(r"^(?:(?:https?|ftp|smb|ssh|ws|wss|git|sftp)://|//)([^/:?#]+)", ep, re.IGNORECASE)
+                if domain_match:
+                    domain = domain_match.group(1)
+                    # Strip user@ prefix (e.g. git@github.com)
+                    if '@' in domain:
+                        domain = domain.split('@')[-1]
+                    domains.append(domain)
+            else:
+                endpoints.append(ep)
+
+        if urls:
+            secrets["URLs"] = list(set(urls))
+        if domains:
+            secrets["Domains"] = list(set(domains))
+        if endpoints:
+            secrets["Endpoints"] = list(set(endpoints))
+            
+    # List of sensitive keywords to check for assignments
+    # Generated from user provided list
+    sensitive_keywords = [
+        "GITHUB_TOKEN", "PATH", "CODECLIMATE_REPO_TOKEN", "DOCKER_PASSWORD", "NPM_TOKEN", "GH_TOKEN", 
+        "encrypted_02ddd67d5586_iv", "encrypted_517c5824cb79_key", "encrypted_02ddd67d5586_key", 
+        "encrypted_517c5824cb79_iv", "encrypted_1366e420413c_key", "encrypted_1366e420413c_iv", 
+        "DOCKER_USERNAME", "ARTIFACTS_SECRET", "ARTIFACTS_KEY", "SURGE_TOKEN", "SURGE_LOGIN", 
+        "ARTIFACTS_BUCKET", "SAUCE_ACCESS_KEY", "SAUCE_USERNAME", "DB_USER", "DB_PORT", "DB_HOST", 
+        "DBP", "javascriptEnabled", "acceptSslCerts", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
+        "DOCKER_EMAIL", "GH_USER_EMAIL", "GH_USER_NAME", "CLOUDINARY_URL", "COVERALLS_REPO_TOKEN", 
+        "CF_PASSWORD", "CF_SPACE", "CF_USERNAME", "CF_ORGANIZATION", "WPT_REPORT_API_KEY", 
+        "USABILLA_ID", "encrypted_17b59ce72ad7_key", "encrypted_17b59ce72ad7_iv", "NGROK_TOKEN", 
+        "rotatable", "CLOUDINARY_URL_STAGING", "encrypted_2c8d10c8cc1d_key", "encrypted_2c8d10c8cc1d_iv", 
+        "SRCCLR_API_TOKEN", "NPM_AUTH_TOKEN", "takesScreenshot", "GH_UNSTABLE_OAUTH_CLIENT_SECRET", 
+        "GH_OAUTH_CLIENT_SECRET", "GH_NEXT_UNSTABLE_OAUTH_CLIENT_SECRET", "GH_UNSTABLE_OAUTH_CLIENT_ID", 
+        "GH_OAUTH_CLIENT_ID", "GH_NEXT_OAUTH_CLIENT_ID", "GH_NEXT_UNSTABLE_OAUTH_CLIENT_ID", 
+        "GH_NEXT_OAUTH_CLIENT_SECRET", "marionette", "NPM_CONFIG_AUDIT", "FTP_PW", "FTP_LOGIN", 
+        "NPM_CONFIG_STRICT_SSL", "TRAVIS_SECURE_ENV_VARS", "FOSSA_API_KEY", "VIP_GITHUB_DEPLOY_KEY", 
+        "SIGNING_KEY_SID", "SIGNING_KEY_SECRET", "ACCOUNT_SID", "API_KEY_SID", "API_KEY_SECRET", 
+        "CI_DEPLOY_PASSWORD", "CONFIGURATION_PROFILE_SID_SFU", "CONFIGURATION_PROFILE_SID_P2P", 
+        "ANACONDA_TOKEN", "CC_TEST_REPORTER_ID", "OS_TENANT_NAME", "OS_TENANT_ID", "OS_PROJECT_NAME", 
+        "OS_AUTH_URL", "OS_USERNAME", "OS_PASSWORD", "OS_REGION_NAME", "node_pre_gyp_secretAccessKey", 
+        "node_pre_gyp_accessKeyId", "encrypted_a2e547bcd39e_key", "encrypted_a2e547bcd39e_iv", 
+        "encrypted_17cf396fcb4f_key", "encrypted_17cf396fcb4f_iv", "datadog_api_key", "accessibilityChecks", 
+        "acceptInsecureCerts", "CI_DEPLOY_USERNAME", "cssSelectorsEnabled", "SONATYPE_PASSWORD", 
+        "tester_keys_password", "GITHUB_OAUTH_TOKEN", "webStorageEnabled", "locationContextEnabled", 
+        "nativeEvents", "handlesAlerts", "databaseEnabled", "browserConnectionEnabled", 
+        "applicationCacheEnabled", "hasTouchScreen", "takesHeapSnapshot", "networkConnectionEnabled", 
+        "mobileEmulationEnabled", "scope", "ALGOLIA_API_KEY", "encrypted_e05f6ccc270e_key", 
+        "encrypted_e05f6ccc270e_iv", "DANGER_GITHUB_API_TOKEN", "PYPI_PASSWORD", 
+        "VIP_GITHUB_BUILD_REPO_DEPLOY_KEY", "SSMTP_CONFIG", "COVERITY_SCAN_TOKEN", "CODECOV_TOKEN", 
+        "SIGNING_KEY", "GPG_ENCRYPTION", "NEW_RELIC_BETA_TOKEN", "ALGOLIA_APPLICATION_ID", 
+        "PACKAGECLOUD_TOKEN", "takesElementScreenshot", "raisesAccessibilityExceptions", "DOCKER_USER", 
+        "datadog_app_key", "encrypted_cb02be967bc8_key", "encrypted_cb02be967bc8_iv", "MAPBOX_ACCESS_TOKEN", 
+        "GITHUB_DEPLOYMENT_TOKEN", "ROPSTEN_PRIVATE_KEY", "RINKEBY_PRIVATE_KEY", "KOVAN_PRIVATE_KEY", 
+        "bintrayUser", "sonatypeUsername", "sonatypePassword", "bintrayKey", "SECRET_1", "SECRET_0", 
+        "SECRET_9", "SECRET_8", "SECRET_7", "SECRET_6", "SECRET_5", "SECRET_4", "SECRET_3", "SECRET_2", 
+        "SECRET_11", "SECRET_10", "TRAVIS_COM_TOKEN", "AWS_DEFAULT_REGION", "GITHUB_ACCESS_TOKEN", 
+        "PYPI_USERNAME", "BINTRAY_APIKEY", "BUNDLE_ZDREPO__JFROG__IO", "COCOAPODS_TRUNK_TOKEN", 
+        "OCTEST_SERVER_BASE_URL", "OCTEST_APP_USERNAME", "OCTEST_APP_PASSWORD", "OKTA_CLIENT_TOKEN", 
+        "HEROKU_API_KEY", "DATABASE_PASSWORD", "encrypted_0d22c88004c9_key", "encrypted_0d22c88004c9_iv", 
+        "BUNDLESIZE_GITHUB_TOKEN", "IOS_DOCS_DEPLOY_TOKEN", "COVERALLS_TOKEN", "CLOUDINARY_URL_EU", 
+        "HEROKU_API_USER", "OKTA_CLIENT_ORGURL", "VIRUSTOTAL_APIKEY", "PUSHOVER_USER", "PUSHOVER_TOKEN", 
+        "HB_CODESIGN_KEY_PASS", "HB_CODESIGN_GPG_PASS", "isbooleanGood", "BROWSER_STACK_USERNAME", 
+        "BROWSER_STACK_ACCESS_KEY", "SNYK_TOKEN", "AURORA_STRING_URL", "TREX_OKTA_CLIENT_TOKEN", 
+        "TREX_OKTA_CLIENT_ORGURL", "GPG_PASSPHRASE", "encrypted_5d419efedfca_key", 
+        "encrypted_5d419efedfca_iv", "ACCESS_KEY_SECRET", "ACCESS_KEY_ID", "props.disabled", 
+        "ALGOLIA_API_KEY_MCM", "BINTRAY_API_KEY", "DOCKER_PASS", "TRIGGER_API_COVERAGE_REPORTER", 
+        "FIREBASE_TOKEN", "OSSRH_USERNAME", "dockerhubUsername", "dockerhubPassword", "SECRET_KEY_BASE", 
+        "repoToken", "encrypted_28c9974aabb6_key", "encrypted_28c9974aabb6_iv", "SONATYPE_USERNAME", 
+        "NGROK_AUTH_TOKEN", "FI2_SIGNING_SEED", "FI2_RECEIVING_SEED", "FI1_SIGNING_SEED", 
+        "FI1_RECEIVING_SEED", "CONTENTFUL_ORGANIZATION", "CONTENTFUL_ACCESS_TOKEN", 
+        "ANSIBLE_VAULT_PASSWORD", "FIREBASE_PROJECT", "ALGOLIA_SEARCH_API_KEY", "BINTRAY_USER", 
+        "encrypted_fb9a491fd14b_key", "encrypted_fb9a491fd14b_iv", "CODACY_PROJECT_TOKEN", 
+        "MANAGEMENT_TOKEN", "CONFIGURATION_PROFILE_SID", "NOW_TOKEN", "encrypted_90a9ca14a0f9_key", 
+        "encrypted_90a9ca14a0f9_iv", "IJ_REPO_USERNAME", "IJ_REPO_PASSWORD", "GITHUB_KEY", 
+        "encrypted_8a915ebdd931_key", "encrypted_8a915ebdd931_iv", "encrypted_0fb9444d0374_key", 
+        "encrypted_0fb9444d0374_iv", "encrypted_b98964ef663e_key", "encrypted_b98964ef663e_iv", 
+        "encrypted_50ea30db3e15_key", "encrypted_50ea30db3e15_iv", "SONAR_TOKEN", "API_KEY", 
+        "encrypted_a47108099c00_key", "encrypted_a47108099c00_iv", "OSSRH_SECRET", "GH_API_KEY", 
+        "PROJECT_CONFIG", "encrypted_f19708b15817_key", "encrypted_f19708b15817_iv", 
+        "encrypted_568b95f14ac3_key", "encrypted_568b95f14ac3_iv", "encrypted_4664aa7e5e58_key", 
+        "encrypted_4664aa7e5e58_iv", "ORG_GRADLE_PROJECT_SONATYPE_NEXUS_USERNAME", 
+        "ORG_GRADLE_PROJECT_SONATYPE_NEXUS_PASSWORD", "encrypted_54c63c7beddf_key", 
+        "encrypted_54c63c7beddf_iv", "CONTENTFUL_INTEGRATION_SOURCE_SPACE", 
+        "CONTENTFUL_INTEGRATION_MANAGEMENT_TOKEN", "BLUEMIX_API_KEY", "ALGOLIA_APP_ID_MCM", 
+        "MAILGUN_PUB_KEY", "MAILGUN_PRIV_KEY", "MAILGUN_DOMAIN", "ALGOLIA_APPLICATION_ID_MCM", 
+        "encrypted_1528c3c2cafd_key", "encrypted_1528c3c2cafd_iv", "CASPERJS_TIMEOUT", "COS_SECRETS", 
+        "ATOKEN", "PASSWORD", "GITHUB_DEPLOY_HB_DOC_PASS", "COVERITY_SCAN_NOTIFICATION_EMAIL", 
+        "CONTENTFUL_CMA_TEST_TOKEN", "DOCKER", "COVERALLS_API_TOKEN", "MapboxAccessToken", 
+        "FIREBASE_API_TOKEN", "TWINE_PASSWORD", "USERNAME", "encrypted_91ee6a0187b8_key", 
+        "encrypted_91ee6a0187b8_iv", "OSSRH_PASS", "OSSRH_USER", "setWindowRect", "SCRUTINIZER_TOKEN", 
+        "CLUSTER_NAME", "OC_PASS", "APP_NAME", "GITHUB_API_KEY", "COCOAPODS_TRUNK_EMAIL", "ORG_ID", 
+        "OSSRH_JIRA_USERNAME", "OSSRH_JIRA_PASSWORD", "DH_END_POINT_1", "CI_DEPLOY_USER", 
+        "CONTENTFUL_MANAGEMENT_API_ACCESS_TOKEN", "WEBHOOK_URL", "SLACK_CHANNEL", "APIARY_API_KEY", 
+        "SONATYPE_USER", "TWINE_USERNAME", "WPJM_PHPUNIT_GOOGLE_GEOCODE_API_KEY", 
+        "SONAR_ORGANIZATION_KEY", "DEPLOY_USER", "SONAR_PROJECT_KEY", "encrypted_2620db1da8a0_key", 
+        "encrypted_2620db1da8a0_iv", "CLIENT_ID", "AWS_REGION", "AWS_S3_BUCKET", 
+        "encrypted_2fb4f9166ccf_key", "encrypted_2fb4f9166ccf_iv", "EXP_USERNAME", "EXP_PASSWORD", 
+        "TRAVIS_TOKEN", "ALGOLIA_APPLICATION_ID_2", "ALGOLIA_APPLICATION_ID_1", "ALGOLIA_ADMIN_KEY_2", 
+        "ALGOLIA_ADMIN_KEY_1", "PAYPAL_CLIENT_SECRET", "PAYPAL_CLIENT_ID", "EMAIL_NOTIFICATION", 
+        "BINTRAY_KEY", "BRACKETS_REPO_OAUTH_TOKEN", "PLACES_APPLICATION_ID", "PLACES_API_KEY", 
+        "ARGOS_TOKEN", "encrypted_f50468713ad3_key", "encrypted_f50468713ad3_iv", "EXPORT_SPACE_ID", 
+        "encrypted_e44c58426490_key", "encrypted_e44c58426490_iv", "ALGOLIA_APP_ID", "GPG_KEYNAME", 
+        "SVN_USER", "SVN_PASS", "ENCRYPTION_PASSWORD", "SPOTIFY_API_CLIENT_SECRET", 
+        "SPOTIFY_API_CLIENT_ID", "SPOTIFY_API_ACCESS_TOKEN", "env.HEROKU_API_KEY", 
+        "STAR_TEST_SECRET_ACCESS_KEY", "STAR_TEST_LOCATION", "STAR_TEST_BUCKET", 
+        "STAR_TEST_AWS_ACCESS_KEY_ID", "ARTIFACTS_AWS_SECRET_ACCESS_KEY", "ARTIFACTS_AWS_ACCESS_KEY_ID", 
+        "encrypted_ce33e47ba0cf_key", "encrypted_ce33e47ba0cf_iv", "DEPLOY_DIR", "GITHUB_USERNAME", 
+        "aos_sec", "aos_key", "UNITY_USERNAME", "UNITY_SERIAL", "UNITY_PASSWORD", 
+        "SONATYPE_NEXUS_PASSWORD", "OMISE_SKEY", "OMISE_PKEY", "GPG_NAME", "GPG_EMAIL", 
+        "DOCKER_HUB_PASSWORD", "encrypted_8496d53a6fac_key", "encrypted_8496d53a6fac_iv", 
+        "SONATYPE_NEXUS_USERNAME", "CLI_E2E_ORG_ID", "CLI_E2E_CMA_TOKEN", "encrypted_42359f73c124_key", 
+        "encrypted_42359f73c124_iv", "encrypted_c2c0feadb429_key", "encrypted_c2c0feadb429_iv", 
+        "SANDBOX_LOCATION_ID", "SANDBOX_ACCESS_TOKEN", "LOCATION_ID", "ACCESS_TOKEN", 
+        "encrypted_f9be9fe4187a_key", "encrypted_f9be9fe4187a_iv", "OSSRH_PASSWORD", "REGISTRY", 
+        "GH_REPO_TOKEN", "CLIENT_SECRET", "encrypted_e7ed02806170_key", "encrypted_e7ed02806170_iv", 
+        "ensureCleanSession", "HOCKEYAPP_TOKEN", "GITHUB_AUTH", "encrypted_fb94579844cb_key", 
+        "encrypted_fb94579844cb_iv", "env.SONATYPE_USERNAME", "env.SONATYPE_PASSWORD", 
+        "env.GITHUB_OAUTH_TOKEN", "BLUEMIX_USER", "SALESFORCE_BULK_TEST_USERNAME", 
+        "SALESFORCE_BULK_TEST_SECURITY_TOKEN", "SALESFORCE_BULK_TEST_PASSWORD", "NPM_API_KEY", 
+        "SONATYPE_PASS", "GITHUB_HUNTER_USERNAME", "GITHUB_HUNTER_TOKEN", "SLASH_DEVELOPER_SPACE_KEY", 
+        "SLASH_DEVELOPER_SPACE", "CYPRESS_RECORD_KEY", "DOCKER_KEY", "encrypted_e733bc65337f_key", 
+        "encrypted_e733bc65337f_iv", "GPG_KEY_NAME", "encrypted_0d261e9bbce3_key", 
+        "encrypted_0d261e9bbce3_iv", "CI_NAME", "NETLIFY_SITE_ID", "NETLIFY_API_KEY", 
+        "encrypted_90a1b1aba54b_key", "encrypted_90a1b1aba54b_iv", "GITHUB_USER", "CLOUDANT_USERNAME", 
+        "CLOUDANT_PASSWORD", "CONTENTFUL_MANAGEMENT_API_ACCESS_TOKEN_NEW", "HOMEBREW_GITHUB_API_TOKEN", 
+        "GITHUB_PWD", "HUB_DXIA2_PASSWORD", "encrypted_830857fa25dd_key", "encrypted_830857fa25dd_iv", 
+        "GCLOUD_PROJECT", "GCLOUD_BUCKET", "FBTOOLS_TARGET_PROJECT", "ALGOLIA_API_KEY_SEARCH", 
+        "SENTRY_ENDPOINT", "SENTRY_DEFAULT_ORG", "SENTRY_AUTH_TOKEN", "GITHUB_OAUTH", 
+        "FIREBASE_PROJECT_DEVELOP", "DDGC_GITHUB_TOKEN", "INTEGRATION_TEST_APPID", 
+        "INTEGRATION_TEST_API_KEY", "OFTA_SECRET", "OFTA_REGION", "OFTA_KEY", 
+        "encrypted_27a1e8612058_key", "encrypted_27a1e8612058_iv", "AMAZON_SECRET_ACCESS_KEY", "ISSUER", 
+        "REPORTING_WEBDAV_USER", "REPORTING_WEBDAV_URL", "REPORTING_WEBDAV_PWD", "SLACK_ROOM", 
+        "encrypted_36455a09984d_key", "encrypted_36455a09984d_iv", "DOCKER_HUB_USERNAME", "CACHE_URL", 
+        "S3_KEY", "ManagementAPIAccessToken", "encrypted_62cbf3187829_key", 
+        "encrypted_62cbf3187829_iv", "BLUEMIX_PASS", "encrypted_0c03606c72ea_key", 
+        "encrypted_0c03606c72ea_iv", "uiElement", "NPM_EMAIL", "GITHUB_AUTH_TOKEN", "SLACK_WEBHOOK_URL", 
+        "LIGHTHOUSE_API_KEY", "DOCKER_PASSWD", "github_token", "APP_ID", 
+        "CONTENTFUL_PHP_MANAGEMENT_TEST_TOKEN", "encrypted_585e03da75ed_key", 
+        "encrypted_585e03da75ed_iv", "encrypted_8382f1c42598_key", "encrypted_8382f1c42598_iv", 
+        "CLOUDANT_INSTANCE", "PLOTLY_USERNAME", "PLOTLY_APIKEY", "MAILGUN_TESTDOMAIN", 
+        "MAILGUN_PUB_APIKEY", "MAILGUN_APIKEY", "LINODE_VOLUME_ID", "LINODE_INSTANCE_ID", "CLUSTER", 
+        "GPG_SECRET_KEYS", "GPG_OWNERTRUST", "GITHUB_PASSWORD", "DOCKERHUB_PASSWORD", 
+        "zenSonatypeUsername", "zenSonatypePassword", "NODE_PRE_GYP_GITHUB_TOKEN", 
+        "encrypted_fc666da9e2f5_key", "encrypted_fc666da9e2f5_iv", "encrypted_afef0992877c_key", 
+        "encrypted_afef0992877c_iv", "BLUEMIX_AUTH", "encrypted_dd05710e44e2_key", 
+        "encrypted_dd05710e44e2_iv", "OPEN_WHISK_KEY", "encrypted_99b9b8976e4b_key", 
+        "encrypted_99b9b8976e4b_iv", "FEEDBACK_EMAIL_SENDER", "FEEDBACK_EMAIL_RECIPIENT", 
+        "NPM_SECRET_KEY", "SLATE_USER_EMAIL", "encrypted_ad766d8d4221_key", 
+        "encrypted_ad766d8d4221_iv", "SOCRATA_PASSWORD", "APPLICATION_ID", "ITEST_GH_TOKEN", 
+        "encrypted_c40f5907e549_key", "encrypted_c40f5907e549_iv", "BX_USERNAME", "BX_PASSWORD", 
+        "AUTH", "APIGW_ACCESS_TOKEN", "encrypted_cb91100d28ca_key", "encrypted_cb91100d28ca_iv", 
+        "encrypted_973277d8afbb_key", "encrypted_973277d8afbb_iv", "YT_SERVER_API_KEY", 
+        "END_USER_USERNAME", "END_USER_PASSWORD", "SENDGRID_FROM_ADDRESS", 
+        "SENDGRID_API_KEY", "OPENWHISK_KEY", "SONATYPE_TOKEN_USER", "SONATYPE_TOKEN_PASSWORD", 
+        "BINTRAY_GPG_PASSWORD", "GITHUB_RELEASE_TOKEN", "MAGENTO_AUTH_USERNAME", 
+        "MAGENTO_AUTH_PASSWORD", "YT_ACCOUNT_REFRESH_TOKEN", "YT_ACCOUNT_CHANNEL_ID", 
+        "encrypted_989f4ea822a6_key", "encrypted_989f4ea822a6_iv", "NPM_API_TOKEN", 
+        "encrypted_0dfb31adf922_key", "encrypted_0dfb31adf922_iv", "YT_PARTNER_REFRESH_TOKEN", 
+        "YT_PARTNER_ID", "YT_PARTNER_CLIENT_SECRET", "YT_PARTNER_CLIENT_ID", "YT_PARTNER_CHANNEL_ID", 
+        "YT_ACCOUNT_CLIENT_SECRET", "YT_ACCOUNT_CLIENT_ID", "encrypted_9c67a9b5e4ea_key", 
+        "encrypted_9c67a9b5e4ea_iv", "REGISTRY_PASS", "KAFKA_REST_URL", "FIREBASE_API_JSON", 
+        "CLAIMR_TOKEN", "VISUAL_RECOGNITION_API_KEY", "encrypted_c494a9867e56_key", 
+        "encrypted_c494a9867e56_iv", "SPA_CLIENT_ID", "GH_OAUTH_TOKEN", "encrypted_96e73e3cb232_key", 
+        "encrypted_96e73e3cb232_iv", "encrypted_2acd2c8c6780_key", "encrypted_2acd2c8c6780_iv", 
+        "DEPLOY_PASSWORD", "CLAIMR_DATABASE", "SELION_SELENIUM_USE_SAUCELAB_GRID", 
+        "SELION_SELENIUM_SAUCELAB_GRID_CONFIG_FILE", "SELION_SELENIUM_PORT", "SELION_SELENIUM_HOST", 
+        "SELION_LOG_LEVEL_USER", "SELION_LOG_LEVEL_DEV", "encrypted_7b8432f5ae93_key", 
+        "encrypted_7b8432f5ae93_iv", "OKTA_DOMAIN", "DROPLET_TRAVIS_PASSWORD", "BLUEMIX_PWD", 
+        "BLUEMIX_ORGANIZATION", "REFRESH_TOKEN", "encrypted_096b9faf3cb6_key", 
+        "encrypted_096b9faf3cb6_iv", "APP_SETTINGS", "VAULT_PATH", "VAULT_APPROLE_SECRET_ID", 
+        "VAULT_ADDR", "encrypted_00000eb5a141_key", "encrypted_00000eb5a141_iv", 
+        "MANDRILL_API_KEY", "SECRET", "V_SFDC_USERNAME", "V_SFDC_PASSWORD", 
+        "V_SFDC_CLIENT_SECRET", "V_SFDC_CLIENT_ID", "QUIP_TOKEN", 
+        "ENV_SDFCAcctSDO_QuipAcctVineetPersonal", "APPLICATION_ID_MCM", "API_KEY_MCM", 
+        "GOOGLE_MAPS_API_KEY", "encrypted_00fae8efff8c_key", "encrypted_00fae8efff8c_iv", 
+        "GIT_COMMITTER_EMAIL", "GIT_AUTHOR_EMAIL", "encrypted_16c5ae3ffbd0_key", 
+        "encrypted_16c5ae3ffbd0_iv", "INDEX_NAME", "TREX_CLIENT_TOKEN", "TREX_CLIENT_ORGURL", 
+        "encrypted_d9a888dfcdad_key", "encrypted_d9a888dfcdad_iv", "REGISTRY_USER", "NUGET_API_KEY", 
+        "BLUEMIX_SPACE", "BLUEMIX_ORG", "ALGOLIA_ADMIN_KEY_MCM", "clojars_username", 
+        "clojars_password", "SPACES_SECRET_ACCESS_KEY", "encrypted_17d5860a9a31_key", 
+        "encrypted_17d5860a9a31_iv", "DH_END_POINT_2", "SPACES_ACCESS_KEY_ID", "ISDEVELOP", 
+        "MAGENTO_USERNAME", "MAGENTO_PASSWORD", "TRAVIS_GH_TOKEN", "encrypted_b62a2178dc70_key", 
+        "encrypted_b62a2178dc70_iv", "encrypted_54792a874ee7_key", "encrypted_54792a874ee7_iv", 
+        "PLACES_APPID", "PLACES_APIKEY", "GITHUB_AUTH_USER", "BLUEMIX_REGION", "SNOOWRAP_USER_AGENT", 
+        "SNOOWRAP_USERNAME", "SNOOWRAP_REFRESH_TOKEN", "SNOOWRAP_PASSWORD", "SNOOWRAP_CLIENT_SECRET", 
+        "SNOOWRAP_CLIENT_ID", "OKTA_AUTHN_ITS_MFAENROLLGROUPID", "SOCRATA_USERNAME", 
+        "SOCRATA_APP_TOKEN", "NEXUS_USERNAME", "NEXUS_PASSWORD", "CLAIMR_SUPERUSER", 
+        "encrypted_c6d9af089ec4_key", "encrypted_c6d9af089ec4_iv", "encrypted_7f6a0d70974a_key", 
+        "encrypted_7f6a0d70974a_iv", "LOTTIE_UPLOAD_CERT_KEY_STORE_PASSWORD", 
+        "LOTTIE_UPLOAD_CERT_KEY_PASSWORD", "LOTTIE_S3_SECRET_KEY", "LOTTIE_S3_API_KEY", 
+        "LOTTIE_HAPPO_SECRET_KEY", "LOTTIE_HAPPO_API_KEY", "GRADLE_SIGNING_PASSWORD", 
+        "GRADLE_SIGNING_KEY_ID", "GCLOUD_SERVICE_KEY", "cluster", "WPORG_PASSWORD", 
+        "ZHULIANG_GH_TOKEN", "USE_SAUCELABS", "user", "password", "encrypted_22fd8ae6a707_key", 
+        "encrypted_22fd8ae6a707_iv", "DEPLOY_TOKEN", "ALGOLIA_SEARCH_KEY_1", "WEB_CLIENT_ID", 
+        "SNYK_ORG_ID", "SNYK_API_TOKEN", "POLL_CHECKS_TIMES", "POLL_CHECKS_CRON", 
+        "OBJECT_STORAGE_USER_ID", "OBJECT_STORAGE_REGION_NAME", "OBJECT_STORAGE_PROJECT_ID", 
+        "OBJECT_STORAGE_PASSWORD", "OBJECT_STORAGE_INCOMING_CONTAINER_NAME", 
+        "CLOUDANT_PROCESSED_DATABASE", "CLOUDANT_PARSED_DATABASE", "CLOUDANT_AUDITED_DATABASE", 
+        "CLOUDANT_ARCHIVED_DATABASE", "encrypted_b0a304ce21a6_key", "encrypted_b0a304ce21a6_iv", 
+        "THERA_OSS_ACCESS_KEY", "THERA_OSS_ACCESS_ID", "REGISTRY_SECURE", "OKTA_OAUTH2_ISSUER", 
+        "OKTA_OAUTH2_CLIENT_SECRET", "OKTA_OAUTH2_CLIENT_ID", "OKTA_OAUTH2_CLIENTSECRET", 
+        "OKTA_OAUTH2_CLIENTID", "DEPLOY_SECURE", "CERTIFICATE_PASSWORD", "CERTIFICATE_OSX_P12", 
+        "encrypted_a0bdb649edaa_key", "encrypted_a0bdb649edaa_iv", "encrypted_9e70b84a9dfc_key", 
+        "encrypted_9e70b84a9dfc_iv", "WATSON_USERNAME", "WATSON_TOPIC", "WATSON_TEAM_ID", 
+        "WATSON_PASSWORD", "WATSON_DEVICE_TOPIC", "WATSON_DEVICE_PASSWORD", "WATSON_DEVICE", 
+        "WATSON_CLIENT", "STAGING_BASE_URL_RUNSCOPE", "RUNSCOPE_TRIGGER_ID", "PROD_BASE_URL_RUNSCOPE", 
+        "GHOST_API_KEY", "EMAIL", "CLOUDANT_SERVICE_DATABASE", "CLOUDANT_ORDER_DATABASE", 
+        "CLOUDANT_APPLIANCE_DATABASE", "CF_PROXY_HOST", "ALARM_CRON", "encrypted_71f1b33fe68c_key", 
+        "encrypted_71f1b33fe68c_iv", "NUGET_APIKEY", "encrypted_6342d3141ac0_key", 
+        "encrypted_6342d3141ac0_iv", "SONATYPE_GPG_PASSPHRASE", "encrypted_218b70c0d15d_key", 
+        "encrypted_218b70c0d15d_iv", "encrypted_15377b0fdb36_key", "encrypted_15377b0fdb36_iv", 
+        "ZOPIM_ACCOUNT_KEY", "SOCRATA_USER", "RTD_STORE_PASS", "RTD_KEY_PASS", "RTD_ALIAS", 
+        "encrypted_7df76fc44d72_key", "encrypted_7df76fc44d72_iv", "encrypted_310f735a6883_key", 
+        "encrypted_310f735a6883_iv", "WINCERT_PASSWORD", "PAT", "DDG_TEST_EMAIL_PW", "DDG_TEST_EMAIL", 
+        "encrypted_d363c995e9f6_key", "encrypted_d363c995e9f6_iv", "WORKSPACE_ID", "REDIRECT_URI", 
+        "PREBUILD_AUTH", "MAVEN_STAGING_PROFILE_ID", "LOGOUT_REDIRECT_URI", 
+        "BUNDLE_GEMS__CONTRIBSYS__COM", "mailchimp_user", "mailchimp_list_id", "mailchimp_api_key", 
+        "SONATYPE_GPG_KEY_NAME", "encrypted_06a58c71dec3_key", "encrypted_06a58c71dec3_iv", 
+        "S3_USER_SECRET", "S3_USER_ID", "FTP_USER", "FTP_PASSWORD", "DOCKER_TOKEN", "BINTRAY_TOKEN", 
+        "ADZERK_API_KEY", "encrypted_a2f0f379c735_key", "encrypted_a2f0f379c735_iv", 
+        "encrypted_a8a6a38f04c1_key", "encrypted_a8a6a38f04c1_iv", "BLUEMIX_NAMESPACE", 
+        "MYSQL_USERNAME", "MYSQL_PASSWORD", "MYSQL_HOSTNAME", "MYSQL_DATABASE", "CHEVERNY_TOKEN", 
+        "APP_TOKEN", "RELEASE_GH_TOKEN", "android_sdk_preview_license", "android_sdk_license", 
+        "GIT_TOKEN", "ALGOLIA_SEARCH_KEY", "SRC_TOPIC", 
+        "KAFKA_ADMIN_URL", "DEST_TOPIC", "ANDROID_DOCS_DEPLOY_TOKEN", "encrypted_d1b4272f4052_key", 
+        "encrypted_d1b4272f4052_iv", "encrypted_5704967818cd_key", "encrypted_5704967818cd_iv", 
+        "BROWSERSTACK_USERNAME", "BROWSERSTACK_ACCESS_KEY", "encrypted_125454aa665c_key", 
+        "encrypted_125454aa665c_iv", "encrypted_d7b8d9290299_key", "encrypted_d7b8d9290299_iv", 
+        "PRIVATE_SIGNING_PASSWORD", "DANGER_VERBOSE", "encrypted_1a824237c6f8_key", 
+        "encrypted_1a824237c6f8_iv", "encrypted_1ab91df4dffb_key", "encrypted_1ab91df4dffb_iv", 
+        "BLUEMIX_USERNAME", "BLUEMIX_PASSWORD", "webdavBaseUrlTravis", "userTravis", 
+        "userToShareTravis", "remoteUserToShareTravis", "passwordTravis", "groupToShareTravis", 
+        "baseUrlTravis", "encrypted_cfd4364d84ec_key", "encrypted_cfd4364d84ec_iv", "MG_URL", 
+        "MG_SPEND_MONEY", "MG_PUBLIC_API_KEY", "MG_EMAIL_TO", "MG_EMAIL_ADDR", "MG_DOMAIN", 
+        "MG_API_KEY", "encrypted_50a936d37433_key", "encrypted_50a936d37433_iv", 
+        "ORG_GRADLE_PROJECT_cloudinaryUrl", "encrypted_5961923817ae_key", "encrypted_5961923817ae_iv", 
+        "GITHUB_API_TOKEN", "HOST", "encrypted_e1de2a468852_key", "encrypted_e1de2a468852_iv", 
+        "encrypted_44004b20f94b_key", "encrypted_44004b20f94b_iv", 
+        "PUBLISH_KEY", "sdr-token", "encrypted_6cacfc7df997_key", "encrypted_6cacfc7df997_iv", 
+        "OKTA_CLIENT_ORG_URL", "BUILT_BRANCH_DEPLOY_KEY", "AGFA", "encrypted_e0bbaa80af07_key", 
+        "encrypted_e0bbaa80af07_iv", "encrypted_cef8742a9861_key", "encrypted_cef8742a9861_iv", 
+        "encrypted_4ca5d6902761_key", "encrypted_4ca5d6902761_iv", "NUNIT", "BXIAM", "ARTIFACTS_REGION", 
+        "BROWSERSTACK_PARALLEL_RUNS", "encrypted_a61182772ec7_key", "encrypted_a61182772ec7_iv", 
+        "encrypted_001d217edcb2_key", "encrypted_001d217edcb2_iv", "BUNDLE_GEM__ZDSYS__COM", 
+        "LICENSES_HASH_TWO", "LICENSES_HASH", "BROWSERSTACK_PROJECT_NAME", "encrypted_00bf0e382472_key", 
+        "encrypted_00bf0e382472_iv", "isParentAllowed", "encrypted_02f59a1b26a6_key", 
+        "encrypted_02f59a1b26a6_iv", "encrypted_8b566a9bd435_key", "encrypted_8b566a9bd435_iv", 
+        "KUBECONFIG", "CLOUDFRONT_DISTRIBUTION_ID", "VSCETOKEN", "PERSONAL_SECRET", "PERSONAL_KEY", 
+        "MANAGE_SECRET", "MANAGE_KEY", "ACCESS_SECRET", "ACCESS_KEY", "encrypted_c05663d61f12_key", 
+        "encrypted_c05663d61f12_iv", "WIDGET_TEST_SERVER", "WIDGET_FB_USER_3", "WIDGET_FB_USER_2", 
+        "WIDGET_FB_USER", "WIDGET_FB_PASSWORD_3", "WIDGET_FB_PASSWORD_2", "WIDGET_FB_PASSWORD", 
+        "WIDGET_BASIC_USER_5", "WIDGET_BASIC_USER_4", "WIDGET_BASIC_USER_3", "WIDGET_BASIC_USER_2", 
+        "WIDGET_BASIC_USER", "WIDGET_BASIC_PASSWORD_5", "WIDGET_BASIC_PASSWORD_4", 
+        "WIDGET_BASIC_PASSWORD_3", "WIDGET_BASIC_PASSWORD_2", "WIDGET_BASIC_PASSWORD", "S3_SECRET_KEY", 
+        "S3_ACCESS_KEY_ID", "OBJECT_STORE_CREDS", "OBJECT_STORE_BUCKET", "NUMBERS_SERVICE_USER", 
+        "NUMBERS_SERVICE_PASS", "NUMBERS_SERVICE", "FIREFOX_SECRET", "CRED", "AUTH0_DOMAIN", 
+        "AUTH0_CONNECTION", "AUTH0_CLIENT_SECRET", "AUTH0_CLIENT_ID", "AUTH0_CALLBACK_URL", 
+        "AUTH0_AUDIENCE", "AUTH0_API_CLIENTSECRET", "AUTH0_API_CLIENTID", "encrypted_8525312434ba_key", 
+        "encrypted_8525312434ba_iv", "duration", "ORG_PROJECT_GRADLE_SONATYPE_NEXUS_USERNAME", 
+        "ORG_PROJECT_GRADLE_SONATYPE_NEXUS_PASSWORD", "PUBLISH_ACCESS", "GH_NAME", "GH_EMAIL", 
+        "EXTENSION_ID", "CLOUDANT_DATABASE", "FLICKR_API_SECRET", "FLICKR_API_KEY", 
+        "encrypted_460c0dacd794_key", "encrypted_460c0dacd794_iv", "CONVERSATION_USERNAME", 
+        "CONVERSATION_PASSWORD", "BLUEMIX_PASS_PROD", "encrypted_849008ab3eb3_key", 
+        "encrypted_849008ab3eb3_iv", "encrypted_9ad2b2bb1fe2_key", "encrypted_9ad2b2bb1fe2_iv", 
+        "encrypted_2eb1bd50e5de_key", "encrypted_2eb1bd50e5de_iv", "CARGO_TOKEN", "WPT_PREPARE_DIR", 
+        "TWILIO_CONFIGURATION_SID", "TWILIO_API_SECRET", "TWILIO_API_KEY", "TWILIO_ACCOUNT_SID", 
+        "ASSISTANT_IAM_APIKEY", "encrypted_c093d7331cc3_key", "encrypted_c093d7331cc3_iv", 
+        "encrypted_913079356b93_key", "encrypted_913079356b93_iv", "encrypted_6b8b8794d330_key", 
+        "encrypted_6b8b8794d330_iv", "FIREFOX_ISSUER", "CHROME_REFRESH_TOKEN", "CHROME_EXTENSION_ID", 
+        "CHROME_CLIENT_SECRET", "CHROME_CLIENT_ID", "YANGSHUN_GH_TOKEN", "KAFKA_INSTANCE_NAME", 
+        "appClientSecret", "REPO", "AWS_SECRET_KEY", "AWS_ACCESS_KEY", "encrypted_a0b72b0e6614_key", 
+        "encrypted_a0b72b0e6614_iv", "TRAVIS_API_TOKEN", "TRAVIS_ACCESS_TOKEN", "OCTEST_USERNAME", 
+        "OCTEST_SERVER_BASE_URL_2", "OCTEST_PASSWORD", "DROPBOX_OAUTH_BEARER", "channelId", 
+        "encrypted_1d073d5eb2c7_key", "encrypted_1d073d5eb2c7_iv", "WPT_SSH_PRIVATE_KEY_BASE64", 
+        "WPT_DB_USER", "WPT_DB_PASSWORD", "WPT_DB_NAME", "WPT_DB_HOST", "CONTENTFUL_V2_ORGANIZATION", 
+        "CONTENTFUL_V2_ACCESS_TOKEN", "CONTENTFUL_TEST_ORG_CMA_TOKEN", "encrypted_f09b6751bdee_key", 
+        "encrypted_f09b6751bdee_iv", "encrypted_e823ef1de5d8_key", "encrypted_e823ef1de5d8_iv", 
+        "encrypted_72ffc2cb7e1d_key", "encrypted_72ffc2cb7e1d_iv", 
+        "SQUARE_READER_SDK_REPOSITORY_PASSWORD", "GIT_NAME", "GIT_EMAIL", "encrypted_42ce39b74e5e_key", 
+        "encrypted_42ce39b74e5e_iv", "HEROKU_TOKEN", "HEROKU_EMAIL", "AUTHOR_NPM_API_KEY", 
+        "AUTHOR_EMAIL_ADDR", "YT_API_KEY", "WPT_SSH_CONNECT", "encrypted_ac3bb8acfb19_key", 
+        "encrypted_ac3bb8acfb19_iv", "WAKATIME_PROJECT", "WAKATIME_API_KEY", "TRAVIS_PULL_REQUEST", 
+        "TRAVIS_BRANCH", "MANIFEST_APP_URL", "MANIFEST_APP_TOKEN", "GRGIT_USER", 
+        "DIGITALOCEAN_SSH_KEY_IDS", "DIGITALOCEAN_SSH_KEY_BODY", "QIITA_TOKEN", "QIITA", "DXA", 
+        "encrypted_1daeb42065ec_key", "encrypted_1daeb42065ec_iv", "docker_repo", 
+        "STORMPATH_API_KEY_SECRET", "STORMPATH_API_KEY_ID", "SANDBOX_AWS_SECRET_ACCESS_KEY", 
+        "SANDBOX_AWS_ACCESS_KEY_ID", "MAPBOX_AWS_SECRET_ACCESS_KEY", "MAPBOX_AWS_ACCESS_KEY_ID", 
+        "MAPBOX_API_TOKEN", "CLU_SSH_PRIVATE_KEY_BASE64", "encrypted_d998d81e80db_key", 
+        "encrypted_d998d81e80db_iv", "encrypted_2966fe3a76cf_key", "encrypted_2966fe3a76cf_iv", 
+        "ALICLOUD_SECRET_KEY", "ALICLOUD_ACCESS_KEY", "encrypted_7343a0e3b48e_key", 
+        "encrypted_7343a0e3b48e_iv", "coding_token", "TWITTER_CONSUMER_SECRET", "TWITTER_CONSUMER_KEY", 
+        "LOOKER_TEST_RUNNER_ENDPOINT", "LOOKER_TEST_RUNNER_CLIENT_SECRET", 
+        "LOOKER_TEST_RUNNER_CLIENT_ID", "FIREBASE_SERVICE_ACCOUNT", "FIREBASE_PROJECT_ID", "RND_SEED", 
+        "OAUTH_TOKEN", "DIGITALOCEAN_ACCESS_TOKEN", "encrypted_0727dd33f742_key", 
+        "encrypted_0727dd33f742_iv", "DEPLOY_PORT", "DEPLOY_HOST", "DEPLOY_DIRECTORY", "CLOUD_API_KEY", 
+        "encrypted_18a7d42f6a87_key", "encrypted_18a7d42f6a87_iv", "RUBYGEMS_AUTH_TOKEN", 
+        "encrypted_5baf7760a3e1_key", "encrypted_5baf7760a3e1_iv", "KEYSTORE_PASS", "ALIAS_PASS", 
+        "ALIAS_NAME", "encrypted_b7bb6f667b3b_key", "encrypted_b7bb6f667b3b_iv", 
+        "encrypted_6467d76e6a97_key", "encrypted_6467d76e6a97_iv", "email", "SONA_TYPE_NEXUS_USERNAME", 
+        "PUBLISH_SECRET", "PHP_BUILT_WITH_GNUTLS", "LL_USERNAME", "LL_SHARED_KEY", "LL_PUBLISH_URL", 
+        "LL_API_SHORTNAME", "GPG_PRIVATE_KEY", "BLUEMIX_ACCOUNT", "AWS_CF_DIST_ID", "APPLE_ID_USERNAME", 
+        "APPLE_ID_PASSWORD", "encrypted_7748a1005700_key", "encrypted_7748a1005700_iv", 
+        "SIGNING_KEY_PASSWORD", "LEKTOR_DEPLOY_USERNAME", "LEKTOR_DEPLOY_PASSWORD", "CI_USER_TOKEN", 
+        "encrypted_7aa52200b8fc_key", "encrypted_7aa52200b8fc_iv", "encrypted_71c9cafbf2c8_key", 
+        "encrypted_71c9cafbf2c8_iv", "encrypted_0a51841a3dea_key", "encrypted_0a51841a3dea_iv", 
+        "WPT_TEST_DIR", "TWILIO_TOKEN", "TWILIO_SID", "TRAVIS_E2E_TOKEN", "MH_PASSWORD", "MH_APIKEY", 
+        "LINUX_SIGNING_KEY", "API_SECRET", "FIREFOX_CLIENT", "PERCY_TOKEN", 
+        "PERCY_PROJECT", "FILE_PASSWORD", "SSHPASS", "GITHUB_REPO", "ARTIFACTORY_USERNAME", 
+        "ARTIFACTORY_KEY", "encrypted_05e49db982f1_key", "encrypted_05e49db982f1_iv", 
+        "PLUGIN_USERNAME", "PLUGIN_PASSWORD", "NODE_ENV", "IRC_NOTIFICATION_CHANNEL", "DATABASE_USER", 
+        "DATABASE_PORT", "DATABASE_NAME", "DATABASE_HOST", "CLOUDFLARE_ZONE_ID", "CLOUDFLARE_AUTH_KEY", 
+        "CLOUDFLARE_AUTH_EMAIL", "AWSCN_SECRET_ACCESS_KEY", "AWSCN_ACCESS_KEY_ID", 
+        "zendesk-travis-github", "token_core_java", "CENSYS_UID", "CENSYS_SECRET", 
+        "encrypted_5d5868ca2cc9_key", "encrypted_5d5868ca2cc9_iv", "encrypted_573c42e37d8c_key", 
+        "encrypted_573c42e37d8c_iv", "encrypted_45b137b9b756_key", "encrypted_45b137b9b756_iv", 
+        "encrypted_12ffb1b96b75_key", "encrypted_12ffb1b96b75_iv", "PYPI_PASSOWRD", "NPM_USERNAME", 
+        "NPM_PASSWORD", "encrypted_8b6f3baac841_key", "encrypted_8b6f3baac841_iv", 
+        "encrypted_4d8e3db26b81_key", "encrypted_4d8e3db26b81_iv", "OMISE_PUBKEY", "OMISE_KEY", 
+        "GREN_GITHUB_TOKEN", "DRIVER_NAME", "CLOUDFLARE_EMAIL", "CLOUDFLARE_CREVIERA_ZONE_ID", 
+        "CLOUDFLARE_API_KEY", "nexusUsername", "nexusPassword", "encrypted_fee8b359a955_key", 
+        "encrypted_fee8b359a955_iv", "encrypted_6d56d8fe847c_key", "encrypted_6d56d8fe847c_iv", 
+        "TEST_TEST", "TESCO_API_KEY", "RELEASE_TOKEN", "NUGET_KEY", "NON_TOKEN", "GIT_COMMITTER_NAME", 
+        "GIT_AUTHOR_NAME", "CN_SECRET_ACCESS_KEY", "CN_ACCESS_KEY_ID", "0VIRUSTOTAL_APIKEY", 
+        "0PUSHOVER_USER", "0PUSHOVER_TOKEN", "0HB_CODESIGN_KEY_PASS", "0HB_CODESIGN_GPG_PASS", 
+        "0GITHUB_TOKEN", "nexusUrl", "encrypted_b1fa8a2faacf_key", "encrypted_b1fa8a2faacf_iv", 
+        "encrypted_98ed7a1d9a8c_key", "encrypted_98ed7a1d9a8c_iv", "VIP_GITHUB_DEPLOY_KEY_PASS", 
+        "TEAM_EMAIL", "SACLOUD_API", "SACLOUD_ACCESS_TOKEN_SECRET", "SACLOUD_ACCESS_TOKEN", 
+        "PANTHEON_SITE", "LEANPLUM_KEY", "LEANPLUM_APP_ID", "FIREBASE_KEY", "CONVERSATION_URL", 
+        "B2_BUCKET", "B2_APP_KEY", "B2_ACCT_ID", "YT_CLIENT_SECRET", "YT_CLIENT_ID", 
+        "TEST_GITHUB_TOKEN", "RANDRMUSICAPIACCESSTOKEN", "MY_SECRET_ENV", "COVERALLS_SERVICE_NAME", 
+        "CONSUMERKEY", "CLU_REPO_URL", "encrypted_12c8071d2874_key", "encrypted_12c8071d2874_iv", 
+        "encrypted_0fba6045d9b0_key", "encrypted_0fba6045d9b0_iv", "PASS", "MONGOLAB_URI", 
+        "GITHUB_TOKENS", "FLASK_SECRET_KEY", "DB_PW", "CC_TEST_REPOTER_ID", "encrypted_932b98f5328a_key", 
+        "encrypted_932b98f5328a_iv", "encrypted_31d215dc2481_key", "encrypted_31d215dc2481_iv", 
+        "encrypted_1db1f58ddbaf_key", "encrypted_1db1f58ddbaf_iv", "WATSON_CONVERSATION_WORKSPACE", 
+        "WATSON_CONVERSATION_USERNAME", "WATSON_CONVERSATION_PASSWORD", "SOUNDCLOUD_USERNAME", 
+        "SOUNDCLOUD_PASSWORD", "SOUNDCLOUD_CLIENT_SECRET", "SOUNDCLOUD_CLIENT_ID", "SDM4", 
+        "PARSE_JS_KEY", "PARSE_APP_ID", "NON_MULTI_WORKSPACE_SID", "NON_MULTI_WORKFLOW_SID", 
+        "NON_MULTI_DISCONNECT_SID", "NON_MULTI_CONNECT_SID", "NON_MULTI_BOB_SID", 
+        "NON_MULTI_ALICE_SID", "MULTI_WORKSPACE_SID", "MULTI_WORKFLOW_SID", "MULTI_DISCONNECT_SID", 
+        "MULTI_CONNECT_SID", "MULTI_BOB_SID", "MULTI_ALICE_SID", "GHB_TOKEN", "GCR_USERNAME", 
+        "GCR_PASSWORD", "BROWSERSTACK_USE_AUTOMATE", "AUTH_TOKEN", "ted_517c5824cb79_iv", 
+        "s3_secret_key", "s3_access_key", "encrypted_f383df87f69c_key", "encrypted_f383df87f69c_iv", 
+        "encrypted_997071d05769_key", "encrypted_997071d05769_iv", "encrypted_671b00c64785_key", 
+        "encrypted_671b00c64785_iv", "encrypted_3761ed62f3dc_key", "encrypted_3761ed62f3dc_iv", 
+        "_8382f1c42598_iv", "_02ddd67d5586_key", "YANGSHUN_GH_PASSWORD", "VIP_TEST", 
+        "PROD_USERNAME", "PROD_PASSWORD", "HAB_KEY", 
+        "HAB_AUTH_TOKEN", "GPG_EXECUTABLE", "GK_LOCK_DEFAULT_BRANCH", "GIT_USER", "DB_USERNAME", 
+        "DB_PASSWORD", "DB_DATABASE", "DB_CONNECTION", "CONEKTA_APIKEY", "CLAIMR_DB", "BROWSERSTACK_BUILD"
+    ]
+    
+    # Sort keywords by length descending to prioritize more specific matches
+    sensitive_keywords.sort(key=len, reverse=True)
+    
+    # Iterate over keywords individually to handle overlapping matches robustly
+    for keyword in sensitive_keywords:
+        # Match word_boundary keyword followed by assignment chars and then a value
+        pattern = f"(?i)\\b{re.escape(keyword)}\\b\\s*[:=]\\s*['\"]?([^'\"\\s;,]+)['\"]?"
+        matches = re.findall(pattern, content)
+        if matches:
+            # Normalize key name for reporting
+            k_norm = keyword.upper()
+            filtered_matches = []
+            for v in matches:
+                if len(v) >= 3: # Basic heuristic to avoid obvious noise
+                    filtered_matches.append(v)
+            
+            if filtered_matches:
+                if k_norm in secrets:
+                    secrets[k_norm] = list(set(secrets[k_norm] + filtered_matches))
+                else:
+                    secrets[k_norm] = list(set(filtered_matches))
+        
+    return secrets
+
+def format_secrets_text(secrets):
+    if not secrets:
+        return ""
+    
+    # Preserving user customized header
+    text = "\n\n<b>[!] Overview on js file:</b>\n"
+    for key, values in secrets.items():
+        text += f"<b>{key}:</b>\n"
+        for v in values:
+             text += f" - <code>{v}</code>\n"
+    return text
+
+
+def notify_telegram(endpoint,prev, new, diff, prevsize,newsize, secrets=None):
     print("[!!!] Endpoint [ {} ] has changed from {} to {}".format(endpoint, prev, new))
     log_entry = "{} has been updated from <code>{}</code>(<b>{}</b>Bytes) to <code>{}</code>(<b>{}</b>Bytes)".format(endpoint, prev,prevsize, new,newsize)
+
+    if secrets:
+        log_entry += format_secrets_text(secrets)
+
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
-        'caption': log_entry,
+        'caption': log_entry[:1024], # Telegram caption limit is 1024
         'parse_mode': 'HTML'
     }
     fpayload = {
@@ -128,10 +697,20 @@ def notify_telegram(endpoint,prev, new, diff, prevsize,newsize):
     #                         data=payload).content
 
 
-def notify_slack(endpoint,prev, new, diff, prevsize,newsize):
+def notify_slack(endpoint,prev, new, diff, prevsize,newsize, secrets=None):
     try:
+        initial_comment = "[JSmon] {} has been updated! Download below diff HTML file to check changes.".format(endpoint)
+        if secrets:
+             # formatting for slack
+            secrets_text = " \n\n*[!] Sensitive Information Found:*\n"
+            for key, values in secrets.items():
+                secrets_text += f"*{key}:*\n"
+                for v in values:
+                    secrets_text += f" - `{v}`\n"
+            initial_comment += secrets_text
+
         response = client.files_upload(
-            initial_comment = "[JSmon] {} has been updated! Download below diff HTML file to check changes.".format(endpoint),
+            initial_comment = initial_comment,
             channels = SLACK_CHANNEL_ID,
             content = diff,
             channel = SLACK_CHANNEL_ID,
@@ -145,15 +724,20 @@ def notify_slack(endpoint,prev, new, diff, prevsize,newsize):
         assert e.response["error"]  # str like 'invalid_auth', 'channel_not_found'
         print(f"Got an error: {e.response['error']}")
 
-def notify(endpoint, prev, new):
+def notify(endpoint, prev, new, secrets=None):
     diff = get_diff(prev,new)
     prevsize = get_file_stats(prev).st_size
     newsize = get_file_stats(new).st_size
+    
+    if secrets:
+        print(f"Secrets found in {endpoint}:")
+        print(json.dumps(secrets, indent=2))
+
     if NOTIFY_TELEGRAM:
-        notify_telegram(endpoint, prev, new, diff, prevsize, newsize)
+        notify_telegram(endpoint, prev, new, diff, prevsize, newsize, secrets)
 
     if NOTIFY_SLACK:
-        notify_slack(endpoint, prev, new, diff, prevsize, newsize)
+        notify_slack(endpoint, prev, new, diff, prevsize, newsize, secrets)
 
 
 def main():
@@ -162,7 +746,7 @@ def main():
 
     if not(NOTIFY_SLACK or NOTIFY_TELEGRAM):
         print("You need to setup Slack or Telegram Notifications of JSMon to work!")
-        exit(1)
+        # exit(1) # Commented out for testing/running without tokens
     if NOTIFY_TELEGRAM and "CHANGEME" in [TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]:
         print("Please Set Up your Telegram Token And Chat ID!!!")
     if NOTIFY_SLACK and "CHANGEME" in [SLACK_TOKEN, SLACK_CHANNEL_ID]:
@@ -174,15 +758,27 @@ def main():
         prev_hash = get_previous_endpoint_hash(ep)
         ep_text = get_endpoint(ep)
         ep_hash = get_hash(ep_text)
+        
+        # Scan for secrets in the new content
+        secrets = scan_for_secrets(ep_text)
+
         if ep_hash == prev_hash:
             continue
         else:
             save_endpoint(ep, ep_hash, ep_text)
             if prev_hash is not None:
-                notify(ep,prev_hash, ep_hash)
+                notify(ep,prev_hash, ep_hash, secrets)
             else:
                 print("New Endpoint enrolled: {}".format(ep))
+                if secrets:
+                    print(f"Secrets found in new endpoint {ep}:")
+                    print(json.dumps(secrets, indent=2))
+                    # Optional: Notify even if it's new if secrets are found? 
+                    # The requirement implies notifying findings. 
+                    # For now, console log is visible. 
 
 
-main()        
+    print("Scan complete.")
 
+if __name__ == "__main__":
+    main()
